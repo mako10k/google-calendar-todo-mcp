@@ -1,0 +1,41 @@
+{
+  "name": "google-calendar-todo-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for managing Google Calendar events and Google Tasks.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "google-calendar-todo-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "auth": "node dist/auth.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "google-calendar",
+    "google-tasks",
+    "calendar",
+    "todo",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@google-cloud/local-auth": "^3.0.1",
+    "@modelcontextprotocol/sdk": "^1.19.1",
+    "google-auth-library": "^9.15.0",
+    "googleapis": "^144.0.0",
+    "zod": "^3.24.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.2",
+    "tsx": "^4.16.5",
+    "typescript": "^5.6.3"
+  }
+}
