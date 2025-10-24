@@ -4,10 +4,19 @@ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { OAuth2Client } from "google-auth-library";
 import type { calendar_v3, tasks_v1 } from "googleapis";
 import { z, ZodError, ZodIssue, ZodObject } from "zod";
+import { DateTime } from "luxon";
 
 import { authorize, getCalendarClient, getTasksClient } from "./googleClient.js";
 
 const DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+const RELATIVE_TODAY_REGEX = /^today(?:(\+|\-)(\d+)(d)?)?$/i;
+const RELATIVE_NOW_REGEX = /^now(?:(\+|\-)(\d+)([smhd]))?$/i;
+const RELATIVE_DAY_OFFSET_REGEX = /^(\+|\-)(\d+)(d)?$/i;
+const RELATIVE_KEYWORDS: Record<string, number> = {
+  tomorrow: 1,
+  yesterday: -1
+};
 
 const propertyFilterRegex = /^[^=]+=[^=]+$/;
 const propertyFilterSchema = z.string().regex(propertyFilterRegex, "Must be in key=value format");
@@ -86,6 +95,98 @@ type CommonEventFields = z.infer<typeof commonEventFieldsSchema>;
 type RemindersInput = z.infer<typeof remindersSchema>;
 type AttendeeInput = z.infer<typeof attendeeSchema>;
 type ExtendedPropertiesInput = z.infer<typeof extendedPropertiesSchema>;
+type DurationUnit = "seconds" | "minutes" | "hours" | "days";
+
+function getUserTimeZone(): string {
+  return process.env.GOOGLE_CALENDAR_MCP_TIMEZONE ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
+}
+
+function resolveTimeZone(preferred?: string): string {
+  return preferred ?? getUserTimeZone();
+}
+
+function formatIso(dt: DateTime): string {
+  return dt.toISO() ?? dt.toUTC().toISO() ?? dt.toISO() ?? new Date(dt.toJSDate()).toISOString();
+}
+
+function formatIsoDate(dt: DateTime): string {
+  return dt.toISODate() ?? dt.toFormat("yyyy-LL-dd");
+}
+
+function formatIsoTime(dt: DateTime): string {
+  return dt.toISOTime({ suppressMilliseconds: true }) ?? dt.toFormat("HH:mm:ss");
+}
+
+function resolveRelativeDate(
+  value: string | undefined,
+  options: { timeZone?: string; preferDateOnly?: boolean } = {}
+): string | undefined {
+  if (!value) {
+    return value;
+  }
+
+  const trimmed = value.trim();
+  const timeZone = resolveTimeZone(options.timeZone);
+
+  // Pass through if already an ISO 8601 string (date or datetime)
+  const parsedIso = DateTime.fromISO(trimmed, { zone: timeZone });
+  if (parsedIso.isValid) {
+    return trimmed;
+  }
+
+  const keywordOffset = RELATIVE_KEYWORDS[trimmed.toLowerCase()];
+  if (keywordOffset !== undefined) {
+    const dt = DateTime.now().setZone(timeZone).startOf("day").plus({ days: keywordOffset });
+    const preferDateOnly = options.preferDateOnly ?? true;
+    return preferDateOnly ? formatIsoDate(dt) : formatIso(dt);
+  }
+
+  const todayMatch = trimmed.match(RELATIVE_TODAY_REGEX);
+  if (todayMatch) {
+    const [, sign, amount] = todayMatch;
+    const delta = amount ? parseInt(amount, 10) * (sign === "-" ? -1 : 1) : 0;
+    const dt = DateTime.now().setZone(timeZone).startOf("day").plus({ days: delta });
+    const preferDateOnly = options.preferDateOnly ?? true;
+    return preferDateOnly ? formatIsoDate(dt) : formatIso(dt);
+  }
+
+  const nowMatch = trimmed.match(RELATIVE_NOW_REGEX);
+  if (nowMatch) {
+    const [, sign, amount, unitRaw] = nowMatch;
+    const dt = DateTime.now().setZone(timeZone);
+    if (!amount || !unitRaw) {
+      return formatIso(dt);
+    }
+
+    const unit = unitRaw.toLowerCase();
+  const units: Record<string, DurationUnit> = {
+      s: "seconds",
+      m: "minutes",
+      h: "hours",
+      d: "days"
+    };
+    const durationUnit = units[unit];
+    if (!durationUnit) {
+      return formatIso(dt);
+    }
+
+    const delta = parseInt(amount, 10) * (sign === "-" ? -1 : 1);
+    const duration: Partial<Record<DurationUnit, number>> = {};
+    duration[durationUnit] = delta;
+    return formatIso(dt.plus(duration));
+  }
+
+  const dayOffsetMatch = trimmed.match(RELATIVE_DAY_OFFSET_REGEX);
+  if (dayOffsetMatch) {
+    const [, sign, amount] = dayOffsetMatch;
+    const delta = parseInt(amount, 10) * (sign === "-" ? -1 : 1);
+    const dt = DateTime.now().setZone(timeZone).startOf("day").plus({ days: delta });
+    const preferDateOnly = options.preferDateOnly ?? true;
+    return preferDateOnly ? formatIsoDate(dt) : formatIso(dt);
+  }
+
+  return value;
+}
 
 function mapEvent(event: calendar_v3.Schema$Event) {
   return {
@@ -240,6 +341,32 @@ export class GoogleCalendarTodoMcpServer {
   }
 
   private registerCalendarTools(): void {
+    const currentTimeInput = z.object({
+      timeZone: z.string().optional()
+    });
+
+    this.registerTool(
+      "current-time",
+      "Get the current timestamp and user-aware timezone information.",
+      currentTimeInput,
+      async (input) => {
+        const timeZone = resolveTimeZone(input.timeZone);
+        const now = DateTime.now().setZone(timeZone);
+
+        return {
+          content: toJsonContent({
+            timeZone,
+            offsetMinutes: now.offset,
+            iso: formatIso(now),
+            isoDate: formatIsoDate(now),
+            isoTime: formatIsoTime(now),
+            human: now.toLocaleString(DateTime.DATETIME_FULL_WITH_SECONDS),
+            unixSeconds: now.toSeconds()
+          })
+        };
+      }
+    );
+
     this.registerTool(
       "list-calendars",
       "List all calendars available to the authenticated user.",
@@ -281,16 +408,19 @@ export class GoogleCalendarTodoMcpServer {
       listEventsInput,
       async (input) => {
         const calendar = this.ensureCalendar();
+        const effectiveTimeZone = resolveTimeZone(input.timeZone);
+        const timeMin = resolveRelativeDate(input.timeMin, { timeZone: effectiveTimeZone, preferDateOnly: false });
+        const timeMax = resolveRelativeDate(input.timeMax, { timeZone: effectiveTimeZone, preferDateOnly: false });
         const response = await calendar.events.list({
           calendarId: input.calendarId,
-          timeMin: input.timeMin,
-          timeMax: input.timeMax,
+          timeMin,
+          timeMax,
           maxResults: input.maxResults,
           q: input.query,
           singleEvents: input.singleEvents,
           orderBy: input.orderBy,
           showDeleted: input.showDeleted,
-          timeZone: input.timeZone,
+          timeZone: effectiveTimeZone,
           pageToken: input.pageToken,
           syncToken: input.syncToken,
           privateExtendedProperty: input.privateExtendedProperty,
@@ -329,6 +459,9 @@ export class GoogleCalendarTodoMcpServer {
       searchEventsInput,
       async (input) => {
         const calendar = this.ensureCalendar();
+        const effectiveTimeZone = resolveTimeZone(input.timeZone);
+        const timeMin = resolveRelativeDate(input.timeMin, { timeZone: effectiveTimeZone, preferDateOnly: false });
+        const timeMax = resolveRelativeDate(input.timeMax, { timeZone: effectiveTimeZone, preferDateOnly: false });
         const results = [] as Array<{
           calendarId: string;
           events: ReturnType<typeof mapEvent>[];
@@ -339,10 +472,10 @@ export class GoogleCalendarTodoMcpServer {
           const response = await calendar.events.list({
             calendarId,
             q: input.query,
-            timeMin: input.timeMin,
-            timeMax: input.timeMax,
+            timeMin,
+            timeMax,
             maxResults: input.maxResultsPerCalendar,
-            timeZone: input.timeZone,
+            timeZone: effectiveTimeZone,
             orderBy: input.orderBy,
             showDeleted: input.showDeleted,
             singleEvents: input.singleEvents,
@@ -387,11 +520,20 @@ export class GoogleCalendarTodoMcpServer {
       createEventInput,
       async (input) => {
         const calendar = this.ensureCalendar();
+        const effectiveTimeZone = resolveTimeZone(input.timeZone);
+        const resolvedStart = resolveRelativeDate(input.start, {
+          timeZone: effectiveTimeZone,
+          preferDateOnly: true
+        }) ?? input.start;
+        const resolvedEnd = resolveRelativeDate(input.end, {
+          timeZone: effectiveTimeZone,
+          preferDateOnly: true
+        }) ?? input.end;
 
         const requestBody: calendar_v3.Schema$Event = {
           summary: input.summary,
-          start: toGoogleDate(input.start, input.timeZone),
-          end: toGoogleDate(input.end, input.timeZone)
+          start: toGoogleDate(resolvedStart, effectiveTimeZone),
+          end: toGoogleDate(resolvedEnd, effectiveTimeZone)
         };
 
         if (input.description !== undefined) requestBody.description = input.description;
@@ -432,11 +574,24 @@ export class GoogleCalendarTodoMcpServer {
       updateEventInput,
       async (input) => {
         const calendar = this.ensureCalendar();
+        const effectiveTimeZone = resolveTimeZone(input.timeZone);
 
         const requestBody: calendar_v3.Schema$Event = {};
         if (input.summary !== undefined) requestBody.summary = input.summary;
-        if (input.start !== undefined) requestBody.start = toGoogleDate(input.start, input.timeZone);
-        if (input.end !== undefined) requestBody.end = toGoogleDate(input.end, input.timeZone);
+        if (input.start !== undefined) {
+          const resolvedStart = resolveRelativeDate(input.start, {
+            timeZone: effectiveTimeZone,
+            preferDateOnly: true
+          }) ?? input.start;
+          requestBody.start = toGoogleDate(resolvedStart, effectiveTimeZone);
+        }
+        if (input.end !== undefined) {
+          const resolvedEnd = resolveRelativeDate(input.end, {
+            timeZone: effectiveTimeZone,
+            preferDateOnly: true
+          }) ?? input.end;
+          requestBody.end = toGoogleDate(resolvedEnd, effectiveTimeZone);
+        }
 
         applyCommonEventFields(requestBody, input);
 
@@ -472,15 +627,18 @@ export class GoogleCalendarTodoMcpServer {
       listEventInstancesInput,
       async (input) => {
         const calendar = this.ensureCalendar();
+        const effectiveTimeZone = resolveTimeZone(input.timeZone);
+        const timeMin = resolveRelativeDate(input.timeMin, { timeZone: effectiveTimeZone, preferDateOnly: false });
+        const timeMax = resolveRelativeDate(input.timeMax, { timeZone: effectiveTimeZone, preferDateOnly: false });
         const response = await calendar.events.instances({
           calendarId: input.calendarId,
           eventId: input.recurringEventId,
-          timeMin: input.timeMin,
-          timeMax: input.timeMax,
+          timeMin,
+          timeMax,
           maxResults: input.maxResults,
           pageToken: input.pageToken,
           showDeleted: input.showDeleted,
-          timeZone: input.timeZone
+          timeZone: effectiveTimeZone
         });
 
         const instances = (response.data.items ?? []).map(mapEvent);
@@ -512,11 +670,24 @@ export class GoogleCalendarTodoMcpServer {
       updateEventInstanceInput,
       async (input) => {
         const calendar = this.ensureCalendar();
+        const effectiveTimeZone = resolveTimeZone(input.timeZone);
 
         const requestBody: calendar_v3.Schema$Event = {};
         if (input.summary !== undefined) requestBody.summary = input.summary;
-        if (input.start !== undefined) requestBody.start = toGoogleDate(input.start, input.timeZone);
-        if (input.end !== undefined) requestBody.end = toGoogleDate(input.end, input.timeZone);
+        if (input.start !== undefined) {
+          const resolvedStart = resolveRelativeDate(input.start, {
+            timeZone: effectiveTimeZone,
+            preferDateOnly: true
+          }) ?? input.start;
+          requestBody.start = toGoogleDate(resolvedStart, effectiveTimeZone);
+        }
+        if (input.end !== undefined) {
+          const resolvedEnd = resolveRelativeDate(input.end, {
+            timeZone: effectiveTimeZone,
+            preferDateOnly: true
+          }) ?? input.end;
+          requestBody.end = toGoogleDate(resolvedEnd, effectiveTimeZone);
+        }
 
         applyCommonEventFields(requestBody, input);
 

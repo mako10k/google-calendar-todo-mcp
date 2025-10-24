@@ -7,6 +7,7 @@ Google Calendar と Google Tasks を統合的に操作できる Model Context Pr
 - カレンダー一覧取得と予定検索・作成・更新・削除
 - 拡張検索フィルタ (複数カレンダー横断 / 拡張プロパティ検索 / ページング対応)
 - 繰り返し予定の作成・インスタンス一覧・個別編集/削除
+- 現在時刻取得ツールと相対日時入力 (today / now など) 対応
 - タスクリスト一覧取得・タスク管理 (作成 / 更新 / 完了 / 削除)
 - OAuth2 デスクトップ アプリ認証フロー & トークンキャッシュ
 - シンプルな stdio トランスポート
@@ -59,6 +60,7 @@ GOOGLE_OAUTH_CREDENTIALS=/path/to/oauth.json npm run dev
 
 | ツール名 | 説明 |
 | --- | --- |
+| `current-time` | 現在時刻とタイムゾーン情報の取得 |
 | `list-calendars` | 利用可能なカレンダー一覧 |
 | `list-events` | 指定カレンダーの予定一覧。時間帯絞り込み・拡張プロパティフィルタ・ページング対応 |
 | `search-events` | 複数カレンダーを跨いだキーワード検索と高度なフィルタリング |
@@ -70,6 +72,15 @@ GOOGLE_OAUTH_CREDENTIALS=/path/to/oauth.json npm run dev
 | `create-task` / `update-task` / `complete-task` / `delete-task` | タスクの追加・更新・完了・削除 |
 
 各ツールの引数は JSON Schema 互換の形で定義されており、MCP クライアントから自動的に補助されます。
+
+## 相対日時入力とタイムゾーン
+
+- `today`, `today+2d`, `today-1d`, `tomorrow`, `yesterday`, `+3d` などで現在の日付から相対的に指定できます。
+- `now`, `now+3h`, `now-30m` のように現在時刻を基準に時間単位で指定できます (秒/分/時間/日)。
+- 相対指定は `list-events` / `search-events` / `list-event-instances` の `timeMin` / `timeMax` や、`create-event` / `update-event` / `update-event-instance` の `start` / `end` などに利用できます。
+- `current-time` ツールを呼び出すと、現在時刻・ISO形式・UNIX 秒・使用中タイムゾーンをまとめて取得できます。
+
+タイムゾーンはデフォルトで実行環境の設定を使用します。`GOOGLE_CALENDAR_MCP_TIMEZONE` 環境変数を指定すると、依存するツールと相対日時の解決にそのタイムゾーンが適用されます。
 
 ## 開発・ビルド
 
