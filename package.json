@@ -1,6 +1,6 @@
 {
   "name": "google-calendar-todo-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Model Context Protocol server for managing Google Calendar events and Google Tasks.",
   "type": "module",
   "main": "dist/index.js",
